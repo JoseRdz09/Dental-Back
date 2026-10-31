@@ -23,6 +23,12 @@ Route::middleware('auth:sanctum')->group(function () {
 
     // Citas
     Route::get('/appointments', [AppointmentController::class,'index',]);
+    Route::post('/appointments', [AppointmentController::class, 'store']);
+
+    Route::put('/appointments/{appointment}', [
+        AppointmentController::class,
+        'update',
+    ]);
 
     // Clínicas
      Route::post('/clinics', [ClinicController::class, 'store']);

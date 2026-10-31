@@ -13,6 +13,8 @@ class Appointment extends Model
         'clinic_id',
         'patient_id',
         'dentist_user_id',
+        'treatment_id',
+        'treatment_price',
         'title',
         'start_at',
         'end_at',
@@ -28,6 +30,7 @@ class Appointment extends Model
         return [
             'start_at' => 'datetime',
             'end_at' => 'datetime',
+            'treatment_price' => 'decimal:2',
         ];
     }
 
@@ -53,5 +56,11 @@ class Appointment extends Model
     public function dentist(): BelongsTo
     {
         return $this->belongsTo(User::class, 'dentist_user_id');
+    }
+
+    /** Tramiento  */
+    public function treatment(): BelongsTo
+    {
+        return $this->belongsTo(Treatment::class, 'treatment_id');
     }
 }

@@ -95,36 +95,36 @@ class PatientController extends Controller
             $query->where('status', $status);
         }
 
-        // Buscar por nombre y apellidos, ignorando acentos.
+        
+        // Buscar por el inicio de cada palabra del nombre o apellido.
+        // Ignora mayúsculas, minúsculas y acentos.
         if ($search !== '') {
-
-            $words = preg_split('/\s+/u', mb_strtolower($search));
+            $words = preg_split(
+                '/\s+/u',
+                mb_strtolower($search),
+                -1,
+                PREG_SPLIT_NO_EMPTY
+            );
 
             $query->where(function ($builder) use ($words) {
-
                 foreach ($words as $word) {
-
-                    if ($word === '') {
-                        continue;
-                    }
-
-                    $pattern = '%' . $word . '%';
+                    $pattern = $word . '%';
 
                     $builder->where(function ($subQuery) use ($pattern) {
-
                         $subQuery
                             ->whereRaw(
-                                'unaccent(LOWER(first_name)) LIKE unaccent(LOWER(?))',
+                                'unaccent(LOWER(first_name)) LIKE unaccent(?)',
                                 [$pattern]
                             )
                             ->orWhereRaw(
-                                'unaccent(LOWER(last_name)) LIKE unaccent(LOWER(?))',
+                                'unaccent(LOWER(last_name)) LIKE unaccent(?)',
                                 [$pattern]
                             );
                     });
                 }
             });
         }
+
 
         // Ordenar pacientes.
         $query->orderByDesc('id');

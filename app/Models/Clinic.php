@@ -7,6 +7,7 @@ use Illuminate\Database\Eloquent\Relations\HasMany;
 use Illuminate\Database\Eloquent\Relations\BelongsToMany;
 use Illuminate\Database\Eloquent\SoftDeletes;
 
+
 class Clinic extends Model
 {
     use SoftDeletes;
@@ -56,5 +57,11 @@ class Clinic extends Model
     public function patients(): HasMany
     {
         return $this->hasMany(Patient::class, 'clinic_id');
+    }
+
+    /** Tratamientos */
+    public function treatments(): HasMany
+    {
+        return $this->hasMany(Treatment::class, 'clinic_id');
     }
 }
