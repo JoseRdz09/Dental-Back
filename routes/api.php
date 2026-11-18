@@ -41,10 +41,9 @@ Route::middleware('auth:sanctum')->group(function () {
 
     // Equipo clínico
     Route::get('/clinics/{clinicId}/team', [ClinicTeamController::class,'index',])->whereNumber('clinicId');
-
     Route::put('/clinics/{clinicId}/team/{userId}', [ClinicTeamController::class,'update',])->whereNumber('clinicId')->whereNumber('userId');
-
     Route::delete('/users/{userId}', [ClinicTeamController::class,'destroy',]);
+    Route::get('/patients/directory', [PatientController::class,'directory',]);
 
     //Profile Settings
     Route::get('/settings', [SettingsController::class, 'show']);

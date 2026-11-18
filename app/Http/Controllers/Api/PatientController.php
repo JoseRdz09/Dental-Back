@@ -145,6 +145,7 @@ class PatientController extends Controller
         return response()->json($response);
     }
 
+    
     /**
      * Mostrar un paciente.
      * GET /api/patients/{patient}
@@ -160,10 +161,17 @@ class PatientController extends Controller
             ], 403);
         }
 
+        $data = $patient->only(self::PATIENT_FIELDS);
+
+        $data['birth_date'] = $patient->birth_date
+            ? $patient->birth_date->format('Y-m-d')
+            : null;
+
         return response()->json([
-            'patient' => $patient->only(self::PATIENT_FIELDS),
+            'patient' => $data,
         ]);
     }
+
 
     /**
      * Registrar un paciente.
@@ -428,5 +436,44 @@ class PatientController extends Controller
         return $user->clinics()
             ->where('clinics.id', $clinicId)
             ->exists();
+    }
+
+
+    /**
+     * Obtener todos los pacientes de la clínica
+     * para el directorio frontend.
+     *
+     * GET /api/patients/directory
+     *
+     * No utiliza paginación.
+     * Excluye automáticamente los registros eliminados.
+     */
+    public function directory(Request $request): JsonResponse
+    {
+        $clinic = $this->getManagedClinic($request);
+
+        if (!$clinic) {
+            return response()->json([
+                'message' => 'No tienes una clínica asignada como administrador.',
+            ], 403);
+        }
+
+        $patients = Patient::query()
+            ->where('clinic_id', $clinic->id)
+            ->select([
+                'id',
+                'first_name',
+                'last_name',
+                'phone',
+                'record_clinical',
+                'status',
+            ])
+            ->orderByDesc('id')
+            ->get();
+
+        return response()->json([
+            'data' => $patients,
+            'total' => $patients->count(),
+        ]);
     }
 }

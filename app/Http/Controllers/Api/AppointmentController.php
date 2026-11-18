@@ -11,7 +11,7 @@ use Illuminate\Http\JsonResponse;
 use Illuminate\Http\Request;
 use Illuminate\Support\Facades\DB;
 use Illuminate\Validation\Rule;
-
+use Illuminate\Support\Carbon;
 
 class AppointmentController extends Controller
 {
@@ -101,19 +101,27 @@ class AppointmentController extends Controller
             ])
             ->orderBy('start_at');
 
+        // Los filtros se comparan en UTC.
         if (isset($validated['start'])) {
-            $query->where('end_at', '>', $validated['start']);
+            $query->where(
+                'end_at',
+                '>',
+                $this->toUtc($validated['start'])
+            );
         }
 
         if (isset($validated['end'])) {
-            $query->where('start_at', '<', $validated['end']);
+            $query->where(
+                'start_at',
+                '<',
+                $this->toUtc($validated['end'])
+            );
         }
 
         return response()->json([
             'clinics' => $clinics,
             'selected_clinic_id' => $clinic->id,
             'data' => $query->get(),
-
             'options' => [
                 'patients' => $patients,
                 'dentists' => $dentists,
@@ -127,17 +135,31 @@ class AppointmentController extends Controller
      */
     public function store(Request $request): JsonResponse
     {
-        $validated = $this->validateAppointment($request);
+        // Identificar la clínica.
+        $clinicData = $request->validate([
+            'clinic_id' => [
+                'required',
+                'integer',
+                'exists:clinics,id',
+            ],
+        ]);
 
+        // Comprobar acceso a la clínica.
         $clinic = $this->getAccessibleClinic(
             $request,
-            $validated['clinic_id']
+            (int) $clinicData['clinic_id']
         );
 
         abort_unless(
             $clinic,
             403,
             'No tienes acceso a esta clínica.'
+        );
+
+        // Validar todos los datos y el horario.
+        $validated = $this->validateAppointment(
+            $request,
+            $clinic
         );
 
         $treatment = Treatment::query()
@@ -153,12 +175,15 @@ class AppointmentController extends Controller
             return Appointment::create([
                 'clinic_id' => $clinic->id,
                 'patient_id' => $validated['patient_id'],
-                'dentist_user_id' => $validated['dentist_user_id'],
+                'dentist_user_id' => $validated['dentist_user_id'] ?? null,
                 'treatment_id' => $treatment->id,
                 'treatment_price' => $treatment->price,
                 'title' => $treatment->name,
-                'start_at' => $validated['start_at'],
-                'end_at' => $validated['end_at'],
+
+                // Almacenar siempre en UTC.
+                'start_at' => $this->toUtc($validated['start_at']),
+                'end_at' => $this->toUtc($validated['end_at']),
+
                 'status' => $validated['status'],
                 'notes' => $validated['notes'] ?? null,
             ]);
@@ -166,7 +191,7 @@ class AppointmentController extends Controller
 
         return response()->json([
             'message' => 'Cita creada correctamente.',
-            'data' => $appointment->load([
+            'data' => $appointment->fresh()->load([
                 'patient:id,first_name,last_name',
                 'dentist:id,name',
                 'treatment:id,name,duration,price',
@@ -177,11 +202,14 @@ class AppointmentController extends Controller
     /**
      * Actualizar una cita.
      */
-    public function update(Request $request, Appointment $appointment): JsonResponse
-    {
+    public function update(
+        Request $request,
+        Appointment $appointment
+    ): JsonResponse {
+        // Comprobar acceso a la clínica.
         $clinic = $this->getAccessibleClinic(
             $request,
-            $appointment->clinic_id
+            (int) $appointment->clinic_id
         );
 
         abort_unless(
@@ -190,9 +218,11 @@ class AppointmentController extends Controller
             'No tienes acceso a esta clínica.'
         );
 
+        // Validar permitiendo conservar el horario original.
         $validated = $this->validateAppointment(
             $request,
-            $appointment->clinic_id
+            $clinic,
+            $appointment
         );
 
         $treatment = Treatment::query()
@@ -207,12 +237,15 @@ class AppointmentController extends Controller
         ) {
             $appointment->update([
                 'patient_id' => $validated['patient_id'],
-                'dentist_user_id' => $validated['dentist_user_id'],
+                'dentist_user_id' => $validated['dentist_user_id'] ?? null,
                 'treatment_id' => $treatment->id,
                 'treatment_price' => $treatment->price,
                 'title' => $treatment->name,
-                'start_at' => $validated['start_at'],
-                'end_at' => $validated['end_at'],
+
+                // Almacenar siempre en UTC.
+                'start_at' => $this->toUtc($validated['start_at']),
+                'end_at' => $this->toUtc($validated['end_at']),
+
                 'status' => $validated['status'],
                 'notes' => $validated['notes'] ?? null,
             ]);
@@ -229,19 +262,42 @@ class AppointmentController extends Controller
     }
 
     /**
+     * Convertir una fecha ISO 8601 a UTC.
+     *
+     * Se conserva el instante representado por la fecha recibida.
+     */
+    private function toUtc(string $value): Carbon
+    {
+        return Carbon::parse($value)->utc();
+    }
+
+    /**
      * Validar los datos de una cita.
+     *
+     * Reglas:
+     *
+     * CREACIÓN:
+     * - No permite fechas pasadas.
+     * - El inicio debe ser estrictamente posterior a ahora.
+     * - Inicio y fin deben utilizar intervalos de 5 minutos.
+     * - La finalización debe ser posterior al inicio.
+     *
+     * EDICIÓN:
+     * - Permite conservar el inicio original aunque ya haya pasado.
+     * - Permite conservar el fin original aunque no coincida con múltiplos de 5.
+     * - Si cambia el inicio, debe ser futuro.
+     * - Si cambia el inicio o el fin, debe respetar intervalos de 5 minutos.
      */
     private function validateAppointment(
         Request $request,
-        ?int $clinicId = null
+        Clinic $clinic,
+        ?Appointment $appointment = null
     ): array {
-        $clinicId = $clinicId ?? $request->input('clinic_id');
-
-        return $request->validate([
+        $validated = $request->validate([
             'clinic_id' => [
-                Rule::requiredIf($clinicId === null),
+                'sometimes',
                 'integer',
-                'exists:clinics,id',
+                Rule::in([$clinic->id]),
             ],
 
             'patient_id' => [
@@ -249,18 +305,19 @@ class AppointmentController extends Controller
                 'integer',
                 Rule::exists('patients', 'id')->where(
                     fn ($query) => $query
-                        ->where('clinic_id', $clinicId)
+                        ->where('clinic_id', $clinic->id)
                         ->where('status', 'active')
                         ->whereNull('deleted_at')
                 ),
             ],
 
+            // Dentista opcional.
             'dentist_user_id' => [
-                'required',
+                'nullable',
                 'integer',
                 Rule::exists('clinic_user', 'user_id')->where(
                     fn ($query) => $query
-                        ->where('clinic_id', $clinicId)
+                        ->where('clinic_id', $clinic->id)
                         ->where('role', 'dentist')
                 ),
             ],
@@ -270,13 +327,21 @@ class AppointmentController extends Controller
                 'integer',
                 Rule::exists('treatments', 'id')->where(
                     fn ($query) => $query
-                        ->where('clinic_id', $clinicId)
+                        ->where('clinic_id', $clinic->id)
                         ->where('is_active', true)
                 ),
             ],
 
-            'start_at' => ['required', 'date'],
-            'end_at' => ['required', 'date', 'after:start_at'],
+            'start_at' => [
+                'required',
+                'date',
+            ],
+
+            'end_at' => [
+                'required',
+                'date',
+                'after:start_at',
+            ],
 
             'status' => [
                 'required',
@@ -289,8 +354,113 @@ class AppointmentController extends Controller
                 ]),
             ],
 
-            'notes' => ['nullable', 'string', 'max:2000'],
+            'notes' => [
+                'nullable',
+                'string',
+                'max:2000',
+            ],
         ]);
+
+        /*
+         * ZONA HORARIA DE LA CLÍNICA
+         */
+
+        $timezone = $clinic->timezone ?: config('app.timezone', 'UTC');
+
+        // Interpretar los instantes recibidos y mostrarlos
+        // en la zona horaria de la clínica.
+        $startAt = $this->toUtc($validated['start_at'])
+            ->setTimezone($timezone);
+
+        $endAt = $this->toUtc($validated['end_at'])
+            ->setTimezone($timezone);
+
+        $now = Carbon::now($timezone);
+
+        /*
+         * COMPARAR CON EL HORARIO ORIGINAL
+         */
+
+        $sameOriginalStart = false;
+        $sameOriginalEnd = false;
+
+        if ($appointment) {
+            $originalStart = Carbon::parse($appointment->start_at)
+                ->utc();
+
+            $originalEnd = Carbon::parse($appointment->end_at)
+                ->utc();
+
+            $newStart = $this->toUtc($validated['start_at']);
+            $newEnd = $this->toUtc($validated['end_at']);
+
+            // Comparar instantes, no cadenas de fechas.
+            $sameOriginalStart = $originalStart->equalTo($newStart);
+            $sameOriginalEnd = $originalEnd->equalTo($newEnd);
+        }
+
+        /*
+         * VALIDAR INTERVALOS DE 5 MINUTOS
+         *
+         * Se comprueban los minutos en la zona local de la clínica.
+         * Los minutos son iguales en UTC y en la zona local.
+         */
+
+        if (
+            !$sameOriginalStart &&
+            $startAt->minute % 5 !== 0
+        ) {
+            throw ValidationException::withMessages([
+                'start_at' => [
+                    'La hora de inicio debe utilizar intervalos de 5 minutos.',
+                ],
+            ]);
+        }
+
+        if (
+            !$sameOriginalEnd &&
+            $endAt->minute % 5 !== 0
+        ) {
+            throw ValidationException::withMessages([
+                'end_at' => [
+                    'La hora de finalización debe utilizar intervalos de 5 minutos.',
+                ],
+            ]);
+        }
+
+        /*
+         * VALIDAR FECHAS Y HORAS PASADAS
+         */
+
+        // Si el inicio es idéntico al original, permitimos conservarlo.
+        // Esto permite cambiar el estado sin reprogramar la cita.
+        //
+        // Si se modifica el inicio, debe ser estrictamente futuro.
+        if (
+            !$sameOriginalStart &&
+            $startAt->lessThanOrEqualTo($now)
+        ) {
+            throw ValidationException::withMessages([
+                'start_at' => [
+                    'La hora de inicio debe ser posterior a la hora actual de la clínica.',
+                ],
+            ]);
+        }
+
+        /*
+         * VALIDACIÓN FINAL
+         *
+         * Se vuelve a comprobar la relación entre ambos instantes.
+         */
+        if (!$endAt->greaterThan($startAt)) {
+            throw ValidationException::withMessages([
+                'end_at' => [
+                    'La hora de finalización debe ser posterior a la hora de inicio.',
+                ],
+            ]);
+        }
+
+        return $validated;
     }
 
     /**
