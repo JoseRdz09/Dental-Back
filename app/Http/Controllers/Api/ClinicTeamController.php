@@ -14,14 +14,19 @@ use App\Models\User;
 class ClinicTeamController extends Controller
 {
     
+   
     /**
-     * Consultar los integrantes de una clínica.
-     * Solo el owner de la organización o el clinic_admin de la clínica.
+     * Obtener todas las clínicas disponibles del usuario
+     * junto con sus integrantes activos.
+     *
+     * GET /api/clinics/team
+     *
+     * Acceso:
+     * - owner: clínicas de sus organizaciones.
+     * - clinic_admin: clínicas donde tiene ese rol.
      */
-    public function index(
-        Request $request,
-        int $clinicId
-    ): JsonResponse {
+    public function index(Request $request): JsonResponse
+    {
         $user = $request->user();
 
         if (!$user) {
@@ -30,38 +35,75 @@ class ClinicTeamController extends Controller
             ], 401);
         }
 
-        // Verificar si es propietario de la organización de la clínica.
-        $isOwner = DB::table('clinics as c')
-            ->join(
-                'organization_user as ou',
-                'ou.organization_id',
-                '=',
-                'c.organization_id'
-            )
-            ->where('c.id', $clinicId)
-            ->where('ou.user_id', $user->id)
-            ->where('ou.role', 'owner')
-            ->exists();
-
-        // Verificar si es administrador de esta clínica.
-        $isClinicAdmin = DB::table('clinic_user')
-            ->where('clinic_id', $clinicId)
-            ->where('user_id', $user->id)
-            ->where('role', 'clinic_admin')
-            ->exists();
-
-        // Permitir únicamente al owner o al clinic_admin.
-        if (!$isOwner && !$isClinicAdmin) {
+        if (!$user->is_active) {
             return response()->json([
-                'message' => 'No tienes permisos para consultar el equipo de esta clínica.',
+                'message' => 'Tu cuenta está desactivada.',
             ], 403);
         }
 
-        // Obtener los integrantes del equipo.
+        // Obtener organizaciones donde el usuario es propietario.
+        $organizationIds = DB::table('organization_user')
+            ->where('user_id', $user->id)
+            ->where('role', 'owner')
+            ->pluck('organization_id');
+
+        // Obtener clínicas donde el usuario es administrador.
+        $clinicAdminIds = DB::table('clinic_user')
+            ->where('user_id', $user->id)
+            ->where('role', 'clinic_admin')
+            ->pluck('clinic_id');
+
+        // Obtener todas las clínicas autorizadas.
+        $clinics = DB::table('clinics')
+            ->whereNull('deleted_at')
+            ->where(function ($query) use (
+                $organizationIds,
+                $clinicAdminIds
+            ) {
+                if ($organizationIds->isNotEmpty()) {
+                    $query->whereIn(
+                        'organization_id',
+                        $organizationIds
+                    );
+                }
+
+                if ($clinicAdminIds->isNotEmpty()) {
+                    $method = $organizationIds->isNotEmpty()
+                        ? 'orWhereIn'
+                        : 'whereIn';
+
+                    $query->{$method}('id', $clinicAdminIds);
+                }
+            })
+            ->select([
+                'id',
+                'name',
+                'logo_url',
+                'email',
+                'phone',
+                'address',
+                'status',
+                'timezone',
+                'organization_id',
+            ])
+            ->orderBy('name')
+            ->get();
+
+        // Si no tiene clínicas disponibles.
+        if ($clinics->isEmpty()) {
+            return response()->json([
+                'clinics' => [],
+            ]);
+        }
+
+        // Obtener los integrantes activos de todas las clínicas.
+        $clinicIds = $clinics->pluck('id');
+
         $team = DB::table('clinic_user as cu')
             ->join('users as u', 'u.id', '=', 'cu.user_id')
-            ->where('cu.clinic_id', $clinicId)
+            ->whereIn('cu.clinic_id', $clinicIds)
             ->where('u.is_active', true)
+            ->whereNull('u.deleted_at')
             ->select([
                 'cu.clinic_id',
                 'cu.user_id',
@@ -71,14 +113,33 @@ class ClinicTeamController extends Controller
                 'cu.created_at',
             ])
             ->orderBy('u.name')
-            ->get();
+            ->get()
+            ->groupBy('clinic_id');
+
+        // Incorporar los integrantes a cada clínica.
+        $clinics = $clinics->map(function ($clinic) use ($team) {
+            $members = $team->get($clinic->id, collect())
+                ->map(function ($member) {
+                    unset($member->clinic_id);
+
+                    return $member;
+                })
+                ->values();
+
+            return [
+                ...((array) $clinic),
+                'team' => [
+                    'total' => $members->count(),
+                    'data' => $members,
+                ],
+            ];
+        });
 
         return response()->json([
-            'clinic_id' => $clinicId,
-            'total' => $team->count(),
-            'data' => $team,
+            'clinics' => $clinics->values(),
         ]);
     }
+
 
     
     /**

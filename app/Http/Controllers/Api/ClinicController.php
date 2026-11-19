@@ -7,6 +7,7 @@ use App\Models\Clinic;
 use Illuminate\Http\JsonResponse;
 use Illuminate\Http\Request;
 use Illuminate\Support\Facades\DB;
+use Illuminate\Support\Facades\Storage;
 
 class ClinicController extends Controller
 {
@@ -34,6 +35,7 @@ class ClinicController extends Controller
             ->select(
                 'clinics.id',
                 'clinics.name',
+                'clinics.logo_url',
                 'clinics.email',
                 'clinics.phone',
                 'clinics.address',
@@ -51,17 +53,16 @@ class ClinicController extends Controller
     }
 
 
-    /**
-     * Actualizar los datos de una clínica.
-     */
+
+    // Actualizar los datos de una clínica.
+    
     public function update(
         Request $request,
         Clinic $clinic
     ): JsonResponse {
         $user = $request->user();
 
-        // Verificar que el usuario sea owner de la organización
-        // a la que pertenece esta clínica.
+        // Verificar que el usuario sea owner de la organización.
         $isOrganizationOwner = DB::table('organization_user')
             ->where('organization_id', $clinic->organization_id)
             ->where('user_id', $user->id)
@@ -77,6 +78,12 @@ class ClinicController extends Controller
         // Validar los datos recibidos.
         $validated = $request->validate([
             'name' => ['required', 'string', 'max:255'],
+            'logo_file' => [
+                'nullable',
+                'image',
+                'mimes:jpg,jpeg,png,webp',
+                'max:2048',
+            ],
             'email' => ['nullable', 'email', 'max:255'],
             'phone' => [
                 'nullable',
@@ -88,15 +95,49 @@ class ClinicController extends Controller
             'timezone' => ['required', 'timezone'],
         ]);
 
-        // Actualizar únicamente los campos permitidos.
-        $clinic->update($validated);
+        // Guardar la URL anterior para eliminarla si se reemplaza.
+        $oldLogoUrl = $clinic->logo_url;
+
+        // El archivo no se guarda directamente en la base de datos.
+        unset($validated['logo_file']);
+
+        // Actualizar los campos normales.
+        $clinic->fill($validated);
+
+        // Procesar el nuevo logo, si se recibió uno.
+        if ($request->hasFile('logo_file')) {
+            $path = $request->file('logo_file')
+                ->store('clinics/logos', 'public');
+
+            // Guardar la URL pública en logo_url.
+            $clinic->logo_url = Storage::disk('public')->url($path);
+        }
+
+        $clinic->save();
+
+        // Eliminar el logo anterior únicamente si pertenece
+        // al almacenamiento público de esta aplicación.
+        if ($request->hasFile('logo_file') && $oldLogoUrl) {
+            $publicBaseUrl = rtrim(
+                Storage::disk('public')->url(''),
+                '/'
+            );
+
+            if (str_starts_with($oldLogoUrl, $publicBaseUrl . '/')) {
+                $oldPath = substr(
+                    $oldLogoUrl,
+                    strlen($publicBaseUrl) + 1
+                );
+
+                Storage::disk('public')->delete($oldPath);
+            }
+        }
 
         return response()->json([
             'message' => 'Clínica actualizada correctamente.',
             'data' => $clinic->fresh(),
         ]);
     }
-
     
     /**
      * Crear una clínica y asociarla a la organización

@@ -7,8 +7,6 @@ use Illuminate\Database\Eloquent\Relations\BelongsTo;
 
 class Treatment extends Model
 {
-    protected $table = 'treatments';
-
     protected $fillable = [
         'clinic_id',
         'name',
@@ -25,10 +23,5 @@ class Treatment extends Model
             'price' => 'decimal:2',
             'is_active' => 'boolean',
         ];
-    }
-
-    public function clinic(): BelongsTo
-    {
-        return $this->belongsTo(Clinic::class, 'clinic_id');
     }
 }

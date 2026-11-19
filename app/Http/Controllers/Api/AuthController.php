@@ -11,6 +11,24 @@ use Illuminate\Validation\ValidationException;
 class AuthController extends Controller
 {
     /**
+     * Obtener la URL pública de un logo.
+     */
+    private function getLogoUrl(?string $logo): ?string
+    {
+        if (!$logo) {
+            return null;
+        }
+
+        // Si ya es una URL completa, conservarla.
+        if (filter_var($logo, FILTER_VALIDATE_URL)) {
+            return $logo;
+        }
+
+        // Generar URL pública desde el disco storage.
+        return url(Storage::disk('public')->url($logo));
+    }
+
+    /**
      * Construir la respuesta del usuario autenticado,
      * incluyendo sus organizaciones y clínicas.
      */
@@ -24,6 +42,7 @@ class AuthController extends Controller
                 return [
                     'id' => $organization->id,
                     'name' => $organization->name,
+                    'logo' => $this->getLogoUrl($organization->logo_url),
                     'role' => $organization->pivot->role,
                 ];
             })
@@ -37,6 +56,7 @@ class AuthController extends Controller
                 return [
                     'id' => $clinic->id,
                     'name' => $clinic->name,
+                    'logo' => $this->getLogoUrl($clinic->logo_url),
                     'role' => $clinic->pivot->role,
                 ];
             })
@@ -83,7 +103,7 @@ class AuthController extends Controller
             ], 403);
         }
 
-        // Regenerar el identificador de sesión tras autenticar.
+        // Regenerar el identificador de sesión.
         $request->session()->regenerate();
 
         return response()->json([
