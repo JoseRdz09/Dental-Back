@@ -11,45 +11,59 @@ use Illuminate\Http\JsonResponse;
 use Illuminate\Http\Request;
 use Illuminate\Support\Facades\DB;
 use Illuminate\Validation\Rule;
+use Illuminate\Validation\ValidationException;
 use Illuminate\Support\Carbon;
 
 class AppointmentController extends Controller
 {
     /**
-     * Obtener clínicas, citas y opciones del formulario.
+     * Obtener únicamente las clínicas autorizadas.
+     */
+    public function clinics(Request $request): JsonResponse
+    {
+        $clinics = Clinic::query()
+            ->whereHas('users', function ($query) use ($request) {
+                $query->where('users.id', $request->user()->id);
+            })
+            ->orderBy('name')
+            ->get([
+                'id',
+                'name',
+            ]);
+
+        return response()->json([
+            'data' => $clinics,
+        ]);
+    }
+
+    /**
+     * Obtener citas de una clínica dentro del rango solicitado.
+     *
+     * No descarga clínicas, pacientes, dentistas ni tratamientos.
      */
     public function index(Request $request): JsonResponse
     {
         $validated = $request->validate([
-            'clinic_id' => ['sometimes', 'integer', 'exists:clinics,id'],
-            'start' => ['sometimes', 'date'],
-            'end' => ['sometimes', 'date', 'after:start'],
+            'clinic_id' => [
+                'required',
+                'integer',
+                'exists:clinics,id',
+            ],
+            'start' => [
+                'required',
+                'date',
+            ],
+            'end' => [
+                'required',
+                'date',
+                'after:start',
+            ],
         ]);
 
-        $userId = $request->user()->id;
-
-        $clinics = Clinic::query()
-            ->whereHas('users', function ($query) use ($userId) {
-                $query->where('users.id', $userId);
-            })
-            ->get();
-
-        if ($clinics->isEmpty()) {
-            return response()->json([
-                'clinics' => [],
-                'selected_clinic_id' => null,
-                'data' => [],
-                'options' => [
-                    'patients' => [],
-                    'dentists' => [],
-                    'treatments' => [],
-                ],
-            ]);
-        }
-
-        $clinicId = $validated['clinic_id'] ?? $clinics->first()->id;
-
-        $clinic = $clinics->firstWhere('id', $clinicId);
+        $clinic = $this->getAccessibleClinic(
+            $request,
+            (int) $validated['clinic_id']
+        );
 
         abort_unless(
             $clinic,
@@ -57,20 +71,179 @@ class AppointmentController extends Controller
             'No tienes acceso a esta clínica.'
         );
 
-        // Pacientes activos.
-        $patients = Patient::query()
-            ->where('clinic_id', $clinicId)
-            ->where('status', 'active')
-            ->whereNull('deleted_at')
-            ->orderBy('first_name')
-            ->orderBy('last_name')
-            ->get([
-                'id',
-                'first_name',
-                'last_name',
-            ]);
+        $start = $this->toUtc($validated['start']);
+        $end = $this->toUtc($validated['end']);
 
-        // Dentistas de la clínica.
+        $appointments = Appointment::query()
+            ->where('clinic_id', $clinic->id)
+
+            // Solo citas que coinciden con el rango solicitado.
+            ->where('end_at', '>', $start)
+            ->where('start_at', '<', $end)
+
+            // Seleccionar únicamente las columnas necesarias.
+            ->select([
+                'id',
+                'clinic_id',
+                'patient_id',
+                'dentist_user_id',
+                'treatment_id',
+                'treatment_price',
+                'title',
+                'start_at',
+                'end_at',
+                'status',
+                'notes',
+            ])
+
+            // Cargar únicamente los campos utilizados de las relaciones.
+            ->with([
+                'patient:id,first_name,last_name',
+                'dentist:id,name',
+                'treatment:id,name,duration,price,is_active',
+            ])
+            ->orderBy('start_at')
+            ->get();
+
+        return response()->json([
+            'data' => $appointments,
+        ]);
+    }
+
+    /**
+     * Obtener estadísticas del mes visualizado.
+     *
+     * - Citas hoy: citas del día actual, si se visualiza el mes actual.
+     * - Por confirmar: citas pendientes del mes.
+     * - Próximas confirmadas: citas confirmadas futuras del mes.
+     * - Canceladas: citas canceladas del mes.
+     */
+    public function stats(Request $request): JsonResponse
+    {
+        $validated = $request->validate([
+            'clinic_id' => [
+                'required',
+                'integer',
+                'exists:clinics,id',
+            ],
+            'start' => [
+                'required',
+                'date',
+            ],
+            'end' => [
+                'required',
+                'date',
+                'after:start',
+            ],
+        ]);
+
+        $clinic = $this->getAccessibleClinic(
+            $request,
+            (int) $validated['clinic_id']
+        );
+
+        abort_unless(
+            $clinic,
+            403,
+            'No tienes acceso a esta clínica.'
+        );
+
+        $timezone = $clinic->timezone ?: config('app.timezone', 'UTC');
+
+        $start = $this->toUtc($validated['start']);
+        $end = $this->toUtc($validated['end']);
+
+        $now = Carbon::now($timezone);
+
+        // Determinar si el mes visualizado es el mes actual.
+        $viewedMonth = $start->copy()
+            ->setTimezone($timezone)
+            ->format('Y-m');
+
+        $currentMonth = $now->format('Y-m');
+
+        $todayCount = 0;
+
+        if ($viewedMonth === $currentMonth) {
+            $todayStart = $now->copy()
+                ->startOfDay()
+                ->utc();
+
+            $todayEnd = $now->copy()
+                ->addDay()
+                ->startOfDay()
+                ->utc();
+
+            $todayCount = Appointment::query()
+                ->where('clinic_id', $clinic->id)
+                ->where('start_at', '>=', $todayStart)
+                ->where('start_at', '<', $todayEnd)
+                ->where('status', '!=', 'Cancelada')
+                ->count();
+        }
+
+        // Citas pendientes del mes.
+        $pendingCount = Appointment::query()
+            ->where('clinic_id', $clinic->id)
+            ->where('start_at', '>=', $start)
+            ->where('start_at', '<', $end)
+            ->where('status', 'Pendiente')
+            ->count();
+
+        // Próximas citas confirmadas del mes.
+        $upcomingCount = Appointment::query()
+            ->where('clinic_id', $clinic->id)
+            ->where('start_at', '>=', $start)
+            ->where('start_at', '<', $end)
+            ->where('start_at', '>=', $now->copy()->utc())
+            ->where('status', 'Confirmada')
+            ->count();
+
+        // Citas canceladas del mes.
+        $cancelledCount = Appointment::query()
+            ->where('clinic_id', $clinic->id)
+            ->where('start_at', '>=', $start)
+            ->where('start_at', '<', $end)
+            ->where('status', 'Cancelada')
+            ->count();
+
+        return response()->json([
+            'data' => [
+                'today' => $todayCount,
+                'pending' => $pendingCount,
+                'upcoming' => $upcomingCount,
+                'cancelled' => $cancelledCount,
+            ],
+        ]);
+    }
+
+    /**
+     * Obtener dentistas y tratamientos de una clínica.
+     *
+     * Los pacientes no se descargan aquí.
+     */
+    public function options(Request $request): JsonResponse
+    {
+        $validated = $request->validate([
+            'clinic_id' => [
+                'required',
+                'integer',
+                'exists:clinics,id',
+            ],
+        ]);
+
+        $clinic = $this->getAccessibleClinic(
+            $request,
+            (int) $validated['clinic_id']
+        );
+
+        abort_unless(
+            $clinic,
+            403,
+            'No tienes acceso a esta clínica.'
+        );
+
+        // Solo ID y nombre de dentistas.
         $dentists = $clinic->users()
             ->wherePivot('role', 'dentist')
             ->orderBy('users.name')
@@ -81,23 +254,20 @@ class AppointmentController extends Controller
 
         /*
          * Tratamientos:
+         * - Todos los activos.
+         * - Inactivos que estén asociados a citas existentes.
          *
-         * - Mostrar todos los activos.
-         * - Mostrar inactivos únicamente si están asociados
-         *   a alguna cita existente de esta clínica.
-         *
-         * Esto permite editar citas históricas sin perder
-         * el tratamiento que ya tenían asignado.
+         * Se conserva la posibilidad de editar citas históricas.
          */
         $treatments = Treatment::query()
-            ->where('clinic_id', $clinicId)
-            ->where(function ($query) use ($clinicId) {
+            ->where('clinic_id', $clinic->id)
+            ->where(function ($query) use ($clinic) {
                 $query->where('is_active', true)
                     ->orWhereIn(
                         'id',
                         Appointment::query()
                             ->select('treatment_id')
-                            ->where('clinic_id', $clinicId)
+                            ->where('clinic_id', $clinic->id)
                             ->whereNotNull('treatment_id')
                     );
             })
@@ -111,42 +281,69 @@ class AppointmentController extends Controller
                 'is_active',
             ]);
 
-        // Citas.
-        $query = Appointment::query()
-            ->where('clinic_id', $clinicId)
-            ->with([
-                'patient:id,first_name,last_name',
-                'dentist:id,name',
-                'treatment:id,name,duration,price,is_active',
-            ])
-            ->orderBy('start_at');
-
-        // Los filtros se comparan en UTC.
-        if (isset($validated['start'])) {
-            $query->where(
-                'end_at',
-                '>',
-                $this->toUtc($validated['start'])
-            );
-        }
-
-        if (isset($validated['end'])) {
-            $query->where(
-                'start_at',
-                '<',
-                $this->toUtc($validated['end'])
-            );
-        }
-
         return response()->json([
-            'clinics' => $clinics,
-            'selected_clinic_id' => $clinic->id,
-            'data' => $query->get(),
-            'options' => [
-                'patients' => $patients,
+            'data' => [
                 'dentists' => $dentists,
                 'treatments' => $treatments,
             ],
+        ]);
+    }
+
+    /**
+     * Buscar pacientes activos de una clínica.
+     *
+     * Devuelve como máximo 10 coincidencias.
+     */
+    public function searchPatients(
+        Request $request,
+        int $clinicId
+    ): JsonResponse {
+        $validated = $request->validate([
+            'q' => [
+                'required',
+                'string',
+                'min:1',
+                'max:100',
+            ],
+        ]);
+
+        $clinic = $this->getAccessibleClinic(
+            $request,
+            $clinicId
+        );
+
+        abort_unless(
+            $clinic,
+            403,
+            'No tienes acceso a esta clínica.'
+        );
+
+        $search = trim($validated['q']);
+        $prefix = $search . '%';
+
+        $patients = Patient::query()
+            ->where('clinic_id', $clinic->id)
+            ->where('status', 'active')
+            ->whereNull('deleted_at')
+            ->where(function ($query) use ($prefix) {
+                $query->where('first_name', 'ILIKE', $prefix)
+                    ->orWhere('last_name', 'ILIKE', $prefix)
+                    ->orWhereRaw(
+                        "CONCAT(first_name, ' ', last_name) ILIKE ?",
+                        [$prefix]
+                    );
+            })
+            ->orderBy('first_name')
+            ->orderBy('last_name')
+            ->limit(10)
+            ->get([
+                'id',
+                'first_name',
+                'last_name',
+            ]);
+
+        return response()->json([
+            'data' => $patients,
         ]);
     }
 
@@ -155,7 +352,6 @@ class AppointmentController extends Controller
      */
     public function store(Request $request): JsonResponse
     {
-        // Identificar la clínica.
         $clinicData = $request->validate([
             'clinic_id' => [
                 'required',
@@ -164,7 +360,6 @@ class AppointmentController extends Controller
             ],
         ]);
 
-        // Comprobar acceso a la clínica.
         $clinic = $this->getAccessibleClinic(
             $request,
             (int) $clinicData['clinic_id']
@@ -176,13 +371,11 @@ class AppointmentController extends Controller
             'No tienes acceso a esta clínica.'
         );
 
-        // Validar los datos y el horario.
         $validated = $this->validateAppointment(
             $request,
             $clinic
         );
 
-        // En nuevas citas solamente se permiten tratamientos activos.
         $treatment = Treatment::query()
             ->where('clinic_id', $clinic->id)
             ->where('is_active', true)
@@ -200,11 +393,8 @@ class AppointmentController extends Controller
                 'treatment_id' => $treatment->id,
                 'treatment_price' => $treatment->price,
                 'title' => $treatment->name,
-
-                // Almacenar siempre en UTC.
                 'start_at' => $this->toUtc($validated['start_at']),
                 'end_at' => $this->toUtc($validated['end_at']),
-
                 'status' => $validated['status'],
                 'notes' => $validated['notes'] ?? null,
             ]);
@@ -227,7 +417,6 @@ class AppointmentController extends Controller
         Request $request,
         Appointment $appointment
     ): JsonResponse {
-        // Comprobar acceso a la clínica.
         $clinic = $this->getAccessibleClinic(
             $request,
             (int) $appointment->clinic_id
@@ -239,25 +428,12 @@ class AppointmentController extends Controller
             'No tienes acceso a esta clínica.'
         );
 
-        // Validar permitiendo conservar el horario original
-        // y el tratamiento histórico de la cita.
         $validated = $this->validateAppointment(
             $request,
             $clinic,
             $appointment
         );
 
-        /*
-         * Obtener el tratamiento.
-         *
-         * Se permite:
-         * - Cualquier tratamiento activo de la clínica.
-         * - El tratamiento que ya tenía esta cita,
-         *   aunque actualmente esté inactivo.
-         *
-         * No se permite asignar un tratamiento inactivo
-         * diferente al que ya tenía la cita.
-         */
         $treatment = Treatment::query()
             ->where('clinic_id', $clinic->id)
             ->where(function ($query) use ($appointment) {
@@ -280,8 +456,6 @@ class AppointmentController extends Controller
                 'dentist_user_id' => $validated['dentist_user_id'] ?? null,
                 'treatment_id' => $treatment->id,
 
-                // Conservar el precio histórico si el tratamiento
-                // está inactivo y ya pertenecía a esta cita.
                 'treatment_price' => $isHistoricalInactiveTreatment
                     ? $appointment->treatment_price
                     : $treatment->price,
@@ -290,10 +464,8 @@ class AppointmentController extends Controller
                     ? $appointment->title
                     : $treatment->name,
 
-                // Almacenar siempre en UTC.
                 'start_at' => $this->toUtc($validated['start_at']),
                 'end_at' => $this->toUtc($validated['end_at']),
-
                 'status' => $validated['status'],
                 'notes' => $validated['notes'] ?? null,
             ]);
@@ -311,8 +483,6 @@ class AppointmentController extends Controller
 
     /**
      * Convertir una fecha ISO 8601 a UTC.
-     *
-     * Se conserva el instante representado por la fecha recibida.
      */
     private function toUtc(string $value): Carbon
     {
@@ -321,21 +491,6 @@ class AppointmentController extends Controller
 
     /**
      * Validar los datos de una cita.
-     *
-     * CREACIÓN:
-     * - No permite fechas pasadas.
-     * - El inicio debe ser estrictamente posterior a ahora.
-     * - Inicio y fin deben utilizar intervalos de 5 minutos.
-     * - La finalización debe ser posterior al inicio.
-     * - Solo permite tratamientos activos.
-     *
-     * EDICIÓN:
-     * - Permite conservar el inicio original aunque ya haya pasado.
-     * - Permite conservar el fin original aunque no coincida
-     *   con múltiplos de 5.
-     * - Si cambia el inicio, debe ser futuro.
-     * - Si cambia el inicio o el fin, debe respetar intervalos de 5 minutos.
-     * - Permite conservar el tratamiento original aunque esté inactivo.
      */
     private function validateAppointment(
         Request $request,
@@ -360,7 +515,6 @@ class AppointmentController extends Controller
                 ),
             ],
 
-            // Dentista opcional.
             'dentist_user_id' => [
                 'nullable',
                 'integer',
@@ -380,8 +534,6 @@ class AppointmentController extends Controller
                             ->where(function ($treatmentQuery) use ($appointment) {
                                 $treatmentQuery->where('is_active', true);
 
-                                // En edición, permitir conservar
-                                // el tratamiento original inactivo.
                                 if ($appointment) {
                                     $treatmentQuery->orWhere(
                                         'id',
@@ -422,14 +574,8 @@ class AppointmentController extends Controller
             ],
         ]);
 
-        /*
-         * ZONA HORARIA DE LA CLÍNICA
-         */
-
         $timezone = $clinic->timezone ?: config('app.timezone', 'UTC');
 
-        // Interpretar los instantes recibidos y mostrarlos
-        // en la zona horaria de la clínica.
         $startAt = $this->toUtc($validated['start_at'])
             ->setTimezone($timezone);
 
@@ -438,31 +584,19 @@ class AppointmentController extends Controller
 
         $now = Carbon::now($timezone);
 
-        /*
-         * COMPARAR CON EL HORARIO ORIGINAL
-         */
-
         $sameOriginalStart = false;
         $sameOriginalEnd = false;
 
         if ($appointment) {
-            $originalStart = Carbon::parse($appointment->start_at)
-                ->utc();
-
-            $originalEnd = Carbon::parse($appointment->end_at)
-                ->utc();
+            $originalStart = Carbon::parse($appointment->start_at)->utc();
+            $originalEnd = Carbon::parse($appointment->end_at)->utc();
 
             $newStart = $this->toUtc($validated['start_at']);
             $newEnd = $this->toUtc($validated['end_at']);
 
-            // Comparar instantes, no cadenas de fechas.
             $sameOriginalStart = $originalStart->equalTo($newStart);
             $sameOriginalEnd = $originalEnd->equalTo($newEnd);
         }
-
-        /*
-         * VALIDAR INTERVALOS DE 5 MINUTOS
-         */
 
         if (
             !$sameOriginalStart &&
@@ -486,14 +620,6 @@ class AppointmentController extends Controller
             ]);
         }
 
-        /*
-         * VALIDAR FECHAS Y HORAS PASADAS
-         */
-
-        // Si el inicio es idéntico al original, permitimos conservarlo.
-        // Esto permite cambiar el estado sin reprogramar la cita.
-        //
-        // Si se modifica el inicio, debe ser estrictamente futuro.
         if (
             !$sameOriginalStart &&
             $startAt->lessThanOrEqualTo($now)
@@ -504,10 +630,6 @@ class AppointmentController extends Controller
                 ],
             ]);
         }
-
-        /*
-         * VALIDACIÓN FINAL
-         */
 
         if (!$endAt->greaterThan($startAt)) {
             throw ValidationException::withMessages([

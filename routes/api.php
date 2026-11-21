@@ -26,8 +26,35 @@ Route::middleware('auth:sanctum')->group(function () {
     Route::post('/logout', [AuthController::class, 'logout']);
 
     // Citas
-    Route::get('/appointments', [AppointmentController::class,'index',]);
-    Route::post('/appointments', [AppointmentController::class, 'store']);
+    Route::get('/appointments/clinics', [
+        AppointmentController::class,
+        'clinics',
+    ]);
+
+    Route::get('/appointments', [
+        AppointmentController::class,
+        'index',
+    ]);
+
+    Route::get('/appointments/stats', [
+        AppointmentController::class,
+        'stats',
+    ]);
+
+    Route::get('/appointments/options', [
+        AppointmentController::class,
+        'options',
+    ]);
+
+    Route::get('/clinics/{clinicId}/patients/search', [
+        AppointmentController::class,
+        'searchPatients',
+    ]);
+
+    Route::post('/appointments', [
+        AppointmentController::class,
+        'store',
+    ]);
 
     Route::put('/appointments/{appointment}', [
         AppointmentController::class,
