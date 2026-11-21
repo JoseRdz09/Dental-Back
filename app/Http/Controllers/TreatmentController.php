@@ -24,6 +24,37 @@ class TreatmentController extends Controller
     }
 
     /**
+     * Create a new treatment for a clinic.
+     */
+    public function store(Request $request, $clinicId)
+    {
+        $validator = Validator::make($request->all(), [
+            'name' => 'required|string|max:255',
+            'description' => 'nullable|string',
+            'duration' => 'required|integer|min:1',
+            'price' => 'required|numeric|min:0',
+            'is_active' => 'required|boolean',
+        ]);
+
+        if ($validator->fails()) {
+            return response()->json([
+                'message' => 'Validation error.',
+                'errors' => $validator->errors()
+            ], 422);
+        }
+
+        $treatment = Treatment::create([
+            'clinic_id' => $clinicId,
+            ...$validator->validated(),
+        ]);
+
+        return response()->json([
+            'message' => 'Treatment created successfully.',
+            'treatment' => $treatment
+        ], 201);
+    }
+
+    /**
      * Update an existing treatment.
      */
     public function update(Request $request, $clinicId, $id)

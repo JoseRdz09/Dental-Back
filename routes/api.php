@@ -2,6 +2,7 @@
 
 use Illuminate\Http\Request;
 use Illuminate\Support\Facades\Route;
+use Illuminate\Validation\ValidationException;
 use App\Http\Controllers\Api\AuthController;
 use App\Http\Controllers\Api\AppointmentController;
 use App\Http\Controllers\Api\ClinicController;
@@ -68,6 +69,7 @@ Route::middleware('auth:sanctum')->group(function () {
         ->whereNumber('clinicId')
         ->group(function () {
             Route::get('/', [TreatmentController::class, 'index']);
+            Route::post('/', [TreatmentController::class, 'store']);
             Route::put('/{id}', [TreatmentController::class, 'update']);
             Route::patch('/{id}', [TreatmentController::class, 'update']);
             Route::delete('/{id}', [TreatmentController::class, 'destroy']);

@@ -61,6 +61,7 @@ class AppointmentController extends Controller
         $patients = Patient::query()
             ->where('clinic_id', $clinicId)
             ->where('status', 'active')
+            ->whereNull('deleted_at')
             ->orderBy('first_name')
             ->orderBy('last_name')
             ->get([
@@ -78,10 +79,28 @@ class AppointmentController extends Controller
                 'users.name',
             ]);
 
-        // Tratamientos activos.
+        /*
+         * Tratamientos:
+         *
+         * - Mostrar todos los activos.
+         * - Mostrar inactivos únicamente si están asociados
+         *   a alguna cita existente de esta clínica.
+         *
+         * Esto permite editar citas históricas sin perder
+         * el tratamiento que ya tenían asignado.
+         */
         $treatments = Treatment::query()
             ->where('clinic_id', $clinicId)
-            ->where('is_active', true)
+            ->where(function ($query) use ($clinicId) {
+                $query->where('is_active', true)
+                    ->orWhereIn(
+                        'id',
+                        Appointment::query()
+                            ->select('treatment_id')
+                            ->where('clinic_id', $clinicId)
+                            ->whereNotNull('treatment_id')
+                    );
+            })
             ->orderBy('name')
             ->get([
                 'id',
@@ -89,6 +108,7 @@ class AppointmentController extends Controller
                 'description',
                 'duration',
                 'price',
+                'is_active',
             ]);
 
         // Citas.
@@ -97,7 +117,7 @@ class AppointmentController extends Controller
             ->with([
                 'patient:id,first_name,last_name',
                 'dentist:id,name',
-                'treatment:id,name,duration,price',
+                'treatment:id,name,duration,price,is_active',
             ])
             ->orderBy('start_at');
 
@@ -156,12 +176,13 @@ class AppointmentController extends Controller
             'No tienes acceso a esta clínica.'
         );
 
-        // Validar todos los datos y el horario.
+        // Validar los datos y el horario.
         $validated = $this->validateAppointment(
             $request,
             $clinic
         );
 
+        // En nuevas citas solamente se permiten tratamientos activos.
         $treatment = Treatment::query()
             ->where('clinic_id', $clinic->id)
             ->where('is_active', true)
@@ -194,7 +215,7 @@ class AppointmentController extends Controller
             'data' => $appointment->fresh()->load([
                 'patient:id,first_name,last_name',
                 'dentist:id,name',
-                'treatment:id,name,duration,price',
+                'treatment:id,name,duration,price,is_active',
             ]),
         ], 201);
     }
@@ -218,16 +239,31 @@ class AppointmentController extends Controller
             'No tienes acceso a esta clínica.'
         );
 
-        // Validar permitiendo conservar el horario original.
+        // Validar permitiendo conservar el horario original
+        // y el tratamiento histórico de la cita.
         $validated = $this->validateAppointment(
             $request,
             $clinic,
             $appointment
         );
 
+        /*
+         * Obtener el tratamiento.
+         *
+         * Se permite:
+         * - Cualquier tratamiento activo de la clínica.
+         * - El tratamiento que ya tenía esta cita,
+         *   aunque actualmente esté inactivo.
+         *
+         * No se permite asignar un tratamiento inactivo
+         * diferente al que ya tenía la cita.
+         */
         $treatment = Treatment::query()
             ->where('clinic_id', $clinic->id)
-            ->where('is_active', true)
+            ->where(function ($query) use ($appointment) {
+                $query->where('is_active', true)
+                    ->orWhere('id', $appointment->treatment_id);
+            })
             ->findOrFail($validated['treatment_id']);
 
         DB::transaction(function () use (
@@ -235,12 +271,24 @@ class AppointmentController extends Controller
             $validated,
             $treatment
         ) {
+            $isHistoricalInactiveTreatment =
+                !$treatment->is_active &&
+                (int) $appointment->treatment_id === (int) $treatment->id;
+
             $appointment->update([
                 'patient_id' => $validated['patient_id'],
                 'dentist_user_id' => $validated['dentist_user_id'] ?? null,
                 'treatment_id' => $treatment->id,
-                'treatment_price' => $treatment->price,
-                'title' => $treatment->name,
+
+                // Conservar el precio histórico si el tratamiento
+                // está inactivo y ya pertenecía a esta cita.
+                'treatment_price' => $isHistoricalInactiveTreatment
+                    ? $appointment->treatment_price
+                    : $treatment->price,
+
+                'title' => $isHistoricalInactiveTreatment
+                    ? $appointment->title
+                    : $treatment->name,
 
                 // Almacenar siempre en UTC.
                 'start_at' => $this->toUtc($validated['start_at']),
@@ -256,7 +304,7 @@ class AppointmentController extends Controller
             'data' => $appointment->fresh()->load([
                 'patient:id,first_name,last_name',
                 'dentist:id,name',
-                'treatment:id,name,duration,price',
+                'treatment:id,name,duration,price,is_active',
             ]),
         ]);
     }
@@ -274,19 +322,20 @@ class AppointmentController extends Controller
     /**
      * Validar los datos de una cita.
      *
-     * Reglas:
-     *
      * CREACIÓN:
      * - No permite fechas pasadas.
      * - El inicio debe ser estrictamente posterior a ahora.
      * - Inicio y fin deben utilizar intervalos de 5 minutos.
      * - La finalización debe ser posterior al inicio.
+     * - Solo permite tratamientos activos.
      *
      * EDICIÓN:
      * - Permite conservar el inicio original aunque ya haya pasado.
-     * - Permite conservar el fin original aunque no coincida con múltiplos de 5.
+     * - Permite conservar el fin original aunque no coincida
+     *   con múltiplos de 5.
      * - Si cambia el inicio, debe ser futuro.
      * - Si cambia el inicio o el fin, debe respetar intervalos de 5 minutos.
+     * - Permite conservar el tratamiento original aunque esté inactivo.
      */
     private function validateAppointment(
         Request $request,
@@ -326,9 +375,21 @@ class AppointmentController extends Controller
                 'required',
                 'integer',
                 Rule::exists('treatments', 'id')->where(
-                    fn ($query) => $query
-                        ->where('clinic_id', $clinic->id)
-                        ->where('is_active', true)
+                    function ($query) use ($clinic, $appointment) {
+                        $query->where('clinic_id', $clinic->id)
+                            ->where(function ($treatmentQuery) use ($appointment) {
+                                $treatmentQuery->where('is_active', true);
+
+                                // En edición, permitir conservar
+                                // el tratamiento original inactivo.
+                                if ($appointment) {
+                                    $treatmentQuery->orWhere(
+                                        'id',
+                                        $appointment->treatment_id
+                                    );
+                                }
+                            });
+                    }
                 ),
             ],
 
@@ -401,9 +462,6 @@ class AppointmentController extends Controller
 
         /*
          * VALIDAR INTERVALOS DE 5 MINUTOS
-         *
-         * Se comprueban los minutos en la zona local de la clínica.
-         * Los minutos son iguales en UTC y en la zona local.
          */
 
         if (
@@ -449,9 +507,8 @@ class AppointmentController extends Controller
 
         /*
          * VALIDACIÓN FINAL
-         *
-         * Se vuelve a comprobar la relación entre ambos instantes.
          */
+
         if (!$endAt->greaterThan($startAt)) {
             throw ValidationException::withMessages([
                 'end_at' => [
