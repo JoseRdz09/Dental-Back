@@ -4,6 +4,7 @@ namespace App\Models;
 
 use Illuminate\Database\Eloquent\Model;
 use Illuminate\Database\Eloquent\Relations\BelongsTo;
+use Illuminate\Database\Eloquent\Relations\HasMany;
 
 class Appointment extends Model
 {
@@ -40,6 +41,12 @@ class Appointment extends Model
     public function clinic(): BelongsTo
     {
         return $this->belongsTo(Clinic::class, 'clinic_id');
+    }
+
+    /** Agregar nuevos conceptos*/
+    public function items()
+    {
+        return $this->hasMany(AppointmentItem::class);
     }
 
     /**

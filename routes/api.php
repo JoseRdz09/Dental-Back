@@ -25,7 +25,8 @@ Route::middleware('auth:sanctum')->group(function () {
     Route::get('/user', [AuthController::class, 'me']);
     Route::post('/logout', [AuthController::class, 'logout']);
 
-    // Citas
+   // Citas
+
     Route::get('/appointments/clinics', [
         AppointmentController::class,
         'clinics',
@@ -51,14 +52,34 @@ Route::middleware('auth:sanctum')->group(function () {
         'searchPatients',
     ]);
 
+    // Crear cita con uno o varios conceptos
     Route::post('/appointments', [
         AppointmentController::class,
         'store',
     ]);
 
+    // Actualizar información general de la cita
     Route::put('/appointments/{appointment}', [
         AppointmentController::class,
         'update',
+    ]);
+
+    // Get inidivudual
+    Route::get('/appointments/{appointment}', [
+        AppointmentController::class,
+        'show',
+    ]);
+
+    // Agregar conceptos a una cita existente
+    Route::post('/appointments/{appointment}/items', [
+        AppointmentController::class,
+        'addItems',
+    ]);
+
+    // Eliminar un concepto de una cita
+    Route::delete('/appointments/{appointment}/items/{itemId}', [
+        AppointmentController::class,
+        'destroyItem',
     ]);
 
     // Clínicas
