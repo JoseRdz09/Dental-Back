@@ -9,6 +9,7 @@ use App\Models\Appointment;
 use App\Models\Clinic;
 use App\Models\Patient;
 use App\Models\Treatment;
+use App\Services\PaymentService;
 use Illuminate\Http\JsonResponse;
 use Illuminate\Http\Request;
 use Illuminate\Support\Carbon;
@@ -24,6 +25,10 @@ class AppointmentController extends Controller
     private const SHOW_ITEM_COLUMNS = 'items:id,appointment_id,type,treatment_id,product_id,description,quantity,unit_price,total,created_at';
 
     private const MINUTE_INTERVAL = 5;
+
+    public function __construct(private readonly PaymentService $payments)
+    {
+    }
 
     /* =====================================================================
      |  ENDPOINTS
@@ -44,6 +49,8 @@ class AppointmentController extends Controller
 
     /**
      * Citas de una clínica dentro del rango solicitado.
+     * Incluye total / paid_total / balance / payment_status calculados
+     * con subconsultas (sin N+1).
      */
     public function index(Request $request): JsonResponse
     {
@@ -75,8 +82,14 @@ class AppointmentController extends Controller
                 'notes',
             ])
             ->with($this->relations())
+            ->withSum('items as total', 'total')
+            ->withSum(
+                ['payments as paid_total' => fn ($q) => $q->where('status', 'completed')],
+                'amount'
+            )
             ->orderBy('start_at')
-            ->get();
+            ->get()
+            ->each(fn (Appointment $a) => $this->presentSummary($a));
 
         return response()->json(['data' => $appointments]);
     }
@@ -197,9 +210,9 @@ class AppointmentController extends Controller
         return response()->json(['data' => $patients]);
     }
 
-    
     /**
-     * Crear una cita con sus conceptos.
+     * Crear una cita con sus conceptos y, opcionalmente, su primer pago.
+     * Todo en una sola transacción.
      */
     public function store(Request $request): JsonResponse
     {
@@ -208,14 +221,17 @@ class AppointmentController extends Controller
         $validated = $request->validate([
             ...$this->appointmentRules($clinic),
             ...$this->itemRules(),
+            ...$this->paymentRules(),
         ]);
 
         // Validaciones independientes de disponibilidad.
         $this->assertValidSchedule($validated, $clinic);
+        $this->assertPaymentAllowed($validated);
 
         $items = $this->buildItems($validated['items'] ?? [], $clinic);
 
         $appointment = DB::transaction(function () use (
+            $request,
             $validated,
             $clinic,
             $items
@@ -246,12 +262,22 @@ class AppointmentController extends Controller
             // 4. Guardar conceptos.
             $this->insertItems($appointment, $items);
 
+            // 5. Registrar el pago (el total sale de los conceptos guardados).
+            if (! empty($validated['payment'])) {
+                $this->payments->register(
+                    $appointment,
+                    $validated['payment'],
+                    (int) $request->user()->id,
+                    $validated['idempotency_key'] ?? null
+                );
+            }
+
             return $appointment;
         });
 
         return response()->json([
             'message' => 'Cita creada correctamente.',
-            'data' => $appointment->load($this->relations()),
+            'data' => $this->fresh($appointment),
         ], 201);
     }
 
@@ -334,24 +360,22 @@ class AppointmentController extends Controller
             ]);
         }
     }
-    
-
 
     /**
-     * Obtener una cita con su información y conceptos.
+     * Obtener una cita con su información, conceptos y resumen de pagos.
      */
     public function show(Request $request, Appointment $appointment): JsonResponse
     {
         $this->authorizedClinic($request, (int) $appointment->clinic_id);
 
-        $appointment->load($this->relations(self::SHOW_ITEM_COLUMNS));
-
-        return response()->json(['data' => $appointment]);
+        return response()->json([
+            'data' => $this->fresh($appointment, self::SHOW_ITEM_COLUMNS),
+        ]);
     }
 
-    
     /**
-     * Actualizar información general de una cita.
+     * Actualizar información general de una cita y, opcionalmente,
+     * registrar un pago. Todo en una sola transacción.
      */
     public function update(
         Request $request,
@@ -362,13 +386,16 @@ class AppointmentController extends Controller
             (int) $appointment->clinic_id
         );
 
-        $validated = $request->validate(
-            $this->appointmentRules($clinic)
-        );
+        $validated = $request->validate([
+            ...$this->appointmentRules($clinic),
+            ...$this->paymentRules(),
+        ]);
 
         $this->assertValidSchedule($validated, $clinic, $appointment);
+        $this->assertPaymentAllowed($validated);
 
         DB::transaction(function () use (
+            $request,
             $validated,
             $clinic,
             $appointment
@@ -397,14 +424,29 @@ class AppointmentController extends Controller
                 'status' => $validated['status'],
                 'notes' => $validated['notes'] ?? null,
             ]);
+
+            // 4. Pago: se bloquea la cita para que dos abonos simultáneos
+            //    no puedan sobrepasar el saldo.
+            if (! empty($validated['payment'])) {
+                Appointment::query()
+                    ->whereKey($appointment->id)
+                    ->lockForUpdate()
+                    ->firstOrFail();
+
+                $this->payments->register(
+                    $appointment,
+                    $validated['payment'],
+                    (int) $request->user()->id,
+                    $validated['idempotency_key'] ?? null
+                );
+            }
         });
 
         return response()->json([
             'message' => 'Cita actualizada correctamente.',
-            'data' => $appointment->load($this->relations()),
+            'data' => $this->fresh($appointment),
         ]);
     }
-
 
     /**
      * Agregar conceptos a una cita existente.
@@ -497,6 +539,52 @@ class AppointmentController extends Controller
     }
 
     /* =====================================================================
+     |  RESUMEN DE PAGOS
+     | ===================================================================== */
+
+    /**
+     * Carga relaciones + resumen de pagos de una cita individual.
+     */
+    private function fresh(
+        Appointment $appointment,
+        string $itemColumns = self::ITEM_COLUMNS
+    ): Appointment {
+        $appointment->load($this->relations($itemColumns));
+
+        $appointment->loadSum('items as total', 'total');
+        $appointment->loadSum(
+            ['payments as paid_total' => fn ($q) => $q->where('status', 'completed')],
+            'amount'
+        );
+
+        return $this->presentSummary($appointment);
+    }
+
+    /**
+     * Calcula balance y payment_status a partir de `total` y `paid_total`
+     * (ya cargados con withSum / loadSum). Todo se maneja en centavos.
+     *
+     * payment_status: unpaid | partial | paid
+     */
+    private function presentSummary(Appointment $appointment): Appointment
+    {
+        $totalCents = $this->payments->toCents($appointment->getAttribute('total'));
+        $paidCents = $this->payments->toCents($appointment->getAttribute('paid_total'));
+        $balanceCents = max($totalCents - $paidCents, 0);
+
+        $status = $paidCents <= 0
+            ? 'unpaid'
+            : ($balanceCents > 0 ? 'partial' : 'paid');
+
+        $appointment->setAttribute('total', $totalCents / 100);
+        $appointment->setAttribute('paid_total', $paidCents / 100);
+        $appointment->setAttribute('balance', $balanceCents / 100);
+        $appointment->setAttribute('payment_status', $status);
+
+        return $appointment;
+    }
+
+    /* =====================================================================
      |  VALIDACIÓN DE CITAS
      | ===================================================================== */
 
@@ -532,6 +620,39 @@ class AppointmentController extends Controller
             'status' => ['required', Rule::enum(AppointmentStatus::class)],
             'notes' => ['nullable', 'string', 'max:2000'],
         ];
+    }
+
+    /**
+     * Reglas del pago (opcional). `received_by` y `clinic_id` nunca vienen
+     * del cliente.
+     */
+    private function paymentRules(): array
+    {
+        return [
+            'payment' => ['nullable', 'array'],
+            'payment.amount' => ['required_with:payment', 'numeric', 'gt:0', 'max:9999999999.99'],
+            'payment.method' => ['required_with:payment', Rule::in(['cash', 'card', 'transfer'])],
+            'payment.reference' => ['nullable', 'string', 'max:255'],
+            'idempotency_key' => ['nullable', 'uuid'],
+        ];
+    }
+
+    /**
+     * Solo se pueden registrar pagos en citas completadas.
+     *
+     * Verifica que `AppointmentStatus::Completed` sea el nombre real del case
+     * en tu enum (el valor debe coincidir con el que guardas en BD).
+     */
+    private function assertPaymentAllowed(array $data): void
+    {
+        if (
+            ! empty($data['payment'])
+            && ($data['status'] ?? null) !== AppointmentStatus::Completed->value
+        ) {
+            throw ValidationException::withMessages([
+                'payment' => ['El pago solo puede registrarse cuando la cita está completada.'],
+            ]);
+        }
     }
 
     /**
@@ -614,7 +735,7 @@ class AppointmentController extends Controller
 
     /**
      * Normaliza los conceptos. El precio de los tratamientos
-     * siempre se toma de la base de datos.
+     * siempre se toma de la base de datos (y queda guardado como snapshot).
      */
     private function buildItems(array $rawItems, Clinic $clinic): array
     {

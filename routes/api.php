@@ -11,13 +11,14 @@ use App\Http\Controllers\Api\SettingsController;
 use App\Http\Controllers\Api\PatientController;
 use App\Http\Controllers\Api\OrganizationController;
 use App\Http\Controllers\TreatmentController;
+use App\Http\Controllers\Api\PaymentController;
 
 
 // Autenticación
 Route::post('/login', [AuthController::class, 'login'])->middleware('throttle:5,1');
 
 // Vincular contraseña a una cuenta nueva del equipo clínico
-Route::post('/clinics/{clinicId}/team', [ClinicTeamController::class,'store',])->whereNumber('clinicId');
+// Route::post('/clinics/{clinicId}/team', [ClinicTeamController::class,'store',])->whereNumber('clinicId');
 
 Route::middleware('auth:sanctum')->group(function () {
     
@@ -122,6 +123,36 @@ Route::middleware('auth:sanctum')->group(function () {
             Route::patch('/{id}', [TreatmentController::class, 'update']);
             Route::delete('/{id}', [TreatmentController::class, 'destroy']);
         });
+
+    
+    // Estado de cuenta y pagos generales
+    Route::prefix('clinics/{clinicId}/patients/{patientId}')
+        ->whereNumber('clinicId')
+        ->whereNumber('patientId')
+        ->group(function () {
+            Route::get('/account', [
+                PaymentController::class,
+                'account',
+            ]);
+
+            Route::post('/payments', [
+                PaymentController::class,
+                'store',
+            ]);
+
+            Route::post('/payments/{payment}/cancel', [
+                PaymentController::class,
+                'cancel',
+            ])->whereNumber('payment');
+        });
+    // Payment
+    Route::get('/clinics/{clinicId}/receivables', [
+        PaymentController::class,
+        'receivables',
+    ]);
+    
+    Route::get('/clinics/{clinicId}/receivables', [PaymentController::class, 'receivables'])
+    ->whereNumber('clinicId');
 
 
 });

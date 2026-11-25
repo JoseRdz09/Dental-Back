@@ -70,4 +70,10 @@ class Appointment extends Model
     {
         return $this->belongsTo(Treatment::class, 'treatment_id');
     }
+
+    // Pagos realizados para esta cita.
+    public function payments(): HasMany
+    {
+        return $this->hasMany(Payment::class, 'appointment_id');
+    }
 }
