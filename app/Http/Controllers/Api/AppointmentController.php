@@ -377,62 +377,54 @@ class AppointmentController extends Controller
      * Actualizar información general de una cita y, opcionalmente,
      * registrar un pago. Todo en una sola transacción.
      */
-    public function update(
-        Request $request,
-        Appointment $appointment
-    ): JsonResponse {
-        $clinic = $this->authorizedClinic(
-            $request,
-            (int) $appointment->clinic_id
-        );
+    public function update(Request $request, Appointment $appointment): JsonResponse
+    {
+        $clinic = $this->authorizedClinic($request, (int) $appointment->clinic_id);
+
+        // Falla rápido: completadas/canceladas no se editan.
+        $this->assertAppointmentEditable($appointment);
 
         $validated = $request->validate([
             ...$this->appointmentRules($clinic),
             ...$this->paymentRules(),
         ]);
 
+        $this->assertPatientUnchanged($validated, $appointment);
         $this->assertValidSchedule($validated, $clinic, $appointment);
         $this->assertPaymentAllowed($validated);
 
-        DB::transaction(function () use (
-            $request,
-            $validated,
-            $clinic,
-            $appointment
-        ) {
+        DB::transaction(function () use ($request, $validated, $clinic, $appointment) {
+            // 0. Bloquear la cita y volver a comprobar el estado real en BD
+            //    (evita que dos peticiones simultáneas pasen la validación).
+            $locked = Appointment::query()
+                ->whereKey($appointment->id)
+                ->lockForUpdate()
+                ->firstOrFail();
+
+            $this->assertAppointmentEditable($locked);
+
             $dentistId = isset($validated['dentist_user_id'])
                 ? (int) $validated['dentist_user_id']
                 : null;
 
-            // 1. Bloquear al dentista seleccionado.
+            // 1. Bloquear al dentista.
             $this->lockDentistSchedule($clinic, $dentistId);
 
-            // 2. Comprobar disponibilidad excluyendo esta cita.
-            $this->assertDentistAvailable(
-                $validated,
-                $clinic,
-                $appointment
-            );
+            // 2. Disponibilidad excluyendo esta cita.
+            $this->assertDentistAvailable($validated, $clinic, $appointment);
 
-            // 3. Actualizar.
+            // 3. Actualizar solo lo permitido (patient_id no se toca).
             $appointment->update([
-                'patient_id' => $validated['patient_id'],
                 'dentist_user_id' => $dentistId,
-                'title' => $validated['title'] ?? $appointment->title,
-                'start_at' => $this->toUtc($validated['start_at']),
-                'end_at' => $this->toUtc($validated['end_at']),
-                'status' => $validated['status'],
-                'notes' => $validated['notes'] ?? null,
+                'title'           => $validated['title'] ?? $appointment->title,
+                'start_at'        => $this->toUtc($validated['start_at']),
+                'end_at'          => $this->toUtc($validated['end_at']),
+                'status'          => $validated['status'],
+                'notes'           => $validated['notes'] ?? null,
             ]);
 
-            // 4. Pago: se bloquea la cita para que dos abonos simultáneos
-            //    no puedan sobrepasar el saldo.
+            // 4. Pago (la cita ya está bloqueada arriba, se quita el segundo lock).
             if (! empty($validated['payment'])) {
-                Appointment::query()
-                    ->whereKey($appointment->id)
-                    ->lockForUpdate()
-                    ->firstOrFail();
-
                 $this->payments->register(
                     $appointment,
                     $validated['payment'],
@@ -451,41 +443,54 @@ class AppointmentController extends Controller
     /**
      * Agregar conceptos a una cita existente.
      */
-    public function addItems(Request $request, Appointment $appointment): JsonResponse
+   public function addItems(Request $request, Appointment $appointment): JsonResponse
     {
         $clinic = $this->authorizedClinic($request, (int) $appointment->clinic_id);
 
-        $this->assertItemsEditable($appointment);
+        $this->assertAppointmentEditable($appointment);
 
         $validated = $request->validate($this->itemRules(required: true));
 
         $items = $this->buildItems($validated['items'], $clinic);
 
-        DB::transaction(fn () => $this->insertItems($appointment, $items));
+        DB::transaction(function () use ($appointment, $items) {
+            $locked = Appointment::query()
+                ->whereKey($appointment->id)
+                ->lockForUpdate()
+                ->firstOrFail();
+
+            $this->assertAppointmentEditable($locked);
+
+            $this->insertItems($appointment, $items);
+        });
 
         return response()->json([
             'message' => 'Conceptos agregados correctamente.',
-            'data' => $appointment->load([self::ITEM_COLUMNS]),
+            'data' => $this->fresh($appointment),
         ]);
     }
+
 
     /**
      * Eliminar un concepto de una cita.
      */
-    public function destroyItem(
-        Request $request,
-        Appointment $appointment,
-        int $itemId
-    ): JsonResponse {
+    public function destroyItem(Request $request, Appointment $appointment, int $itemId): JsonResponse
+    {
         $this->authorizedClinic($request, (int) $appointment->clinic_id);
 
-        $this->assertItemsEditable($appointment);
+        DB::transaction(function () use ($appointment, $itemId) {
+            $locked = Appointment::query()
+                ->whereKey($appointment->id)
+                ->lockForUpdate()
+                ->firstOrFail();
 
-        $appointment->items()->whereKey($itemId)->firstOrFail()->delete();
+            $this->assertAppointmentEditable($locked);
+
+            $appointment->items()->whereKey($itemId)->firstOrFail()->delete();
+        });
 
         return response()->json(['message' => 'Concepto eliminado correctamente.']);
     }
-
     /* =====================================================================
      |  ACCESO Y CONTEXTO
      | ===================================================================== */
@@ -823,18 +828,35 @@ class AppointmentController extends Controller
         ));
     }
 
-    /**
-     * Impide modificar conceptos de citas completadas o canceladas.
+   /**
+     * Las citas completadas o canceladas (ya guardadas) son de solo lectura.
      */
-    private function assertItemsEditable(Appointment $appointment): void
+    private function assertAppointmentEditable(Appointment $appointment): void
     {
-        $status = AppointmentStatus::tryFrom((string) $appointment->status);
+        $raw = $appointment->status;
+
+        $status = $raw instanceof AppointmentStatus
+            ? $raw
+            : AppointmentStatus::tryFrom((string) $raw);
 
         if ($status?->isClosed()) {
             throw ValidationException::withMessages([
                 'status' => [
-                    "No se pueden modificar los conceptos de una cita {$status->value}.",
+                    "No se puede modificar una cita {$status->value}.",
                 ],
+            ]);
+        }
+    }
+
+    /**
+     * Solo se permite cambiar dentista, notas, horario (reglas de
+     * assertValidSchedule), estado y conceptos. El paciente no cambia.
+     */
+    private function assertPatientUnchanged(array $data, Appointment $appointment): void
+    {
+        if ((int) $data['patient_id'] !== (int) $appointment->patient_id) {
+            throw ValidationException::withMessages([
+                'patient_id' => ['No se puede cambiar el paciente de una cita existente.'],
             ]);
         }
     }

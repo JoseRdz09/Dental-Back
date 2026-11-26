@@ -150,9 +150,6 @@ Route::middleware('auth:sanctum')->group(function () {
         PaymentController::class,
         'receivables',
     ]);
-    
-    Route::get('/clinics/{clinicId}/receivables', [PaymentController::class, 'receivables'])
-    ->whereNumber('clinicId');
 
 
 });
