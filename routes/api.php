@@ -10,8 +10,9 @@ use App\Http\Controllers\Api\ClinicTeamController;
 use App\Http\Controllers\Api\SettingsController;
 use App\Http\Controllers\Api\PatientController;
 use App\Http\Controllers\Api\OrganizationController;
-use App\Http\Controllers\TreatmentController;
+use App\Http\Controllers\Api\TreatmentController;
 use App\Http\Controllers\Api\PaymentController;
+use App\Http\Controllers\Api\DashboardOwnerController;
 
 
 // Autenticación
@@ -150,6 +151,13 @@ Route::middleware('auth:sanctum')->group(function () {
         PaymentController::class,
         'receivables',
     ]);
+
+    // Dashboard Owner
+    Route::prefix('dashboard-owner')->group(function () {
+        Route::get('/clinics', [DashboardOwnerController::class, 'clinics']);
+        Route::get('/stats',   [DashboardOwnerController::class, 'stats']);
+        Route::get('/team',    [DashboardOwnerController::class, 'team']);
+    });
 
 
 });
